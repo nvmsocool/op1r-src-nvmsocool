@@ -16,6 +16,8 @@ static void *mute1_node, *mute2_node;
 static void *green_move_node;
 static void *balloon_node;
 static void *spinner_node;
+static void *key_node[24];
+static void *keyd_node[24];
 
 static uint32_t spinner_ph, vibrato_ph;
 
@@ -50,6 +52,29 @@ static void horn_init(void *scr)
     balloon_node = op1_find_node(scr, "white");
     spinner_node = op1_find_node(scr, "red-spinner");
     spinner_ph = 0;
+
+    for (int i = 0; i < 24; i++) {
+        int num = i + 1;
+        char buf[8];
+        buf[0] = '_';
+        if (num < 10) {
+            buf[1] = '0' + num;
+            buf[2] = '\0';
+        } else {
+            buf[1] = '0' + num / 10;
+            buf[2] = '0' + (num % 10);
+            buf[3] = '\0';
+        }
+        key_node[i] = op1_find_node(scr, buf);
+        if (num < 10) {
+            buf[2] = 'd';
+            buf[3] = '\0';
+        } else {
+            buf[3] = 'd';
+            buf[4] = '\0';
+        }
+        keyd_node[i] = op1_find_node(scr, buf);
+    }
 }
 
 static void horn_update(void *scr, int dt)
@@ -94,10 +119,28 @@ static void horn_update(void *scr, int dt)
         op1_node_rotate(spinner_node, OP1_Q10(203.33), OP1_Q10(95.05), tsin(angle), tcos(angle));
     }
 
+    /* Update key states from held notes */
+    int held[24];
+    for (int _h = 0; _h < 24; _h++) held[_h] = 0;
+#ifndef OP1_HOST
+    int count = *(volatile int *)0x01DFF134;
+    for (int h = 0; h < count && h < 24; h++) {
+        int note = (((volatile int *)0x01DFE734)[h * 5]);
+        if (note >= 0 && note < 128) {
+            int key = (note + 1) % 24;
+            if (key >= 0 && key < 24) held[key] = 1;
+        }
+    }
+#endif
+    for (int i = 0; i < 24; i++) {
+        if (key_node[i]) op1_node_set_visible(key_node[i], !held[i]);
+        if (keyd_node[i]) op1_node_set_visible(keyd_node[i], held[i]);
+    }
+
     op1_screen_draw(scr, dt);                       /* the SVG first: raster lines drawn before it are lost */
 
     /* Green knob: draw stretch lines with moving right endpoints */
-    {
+{
         int32_t ext = (int32_t)k[1] * 55357 >> 15;  /* Q10: 0..54.06 (as the slide) */
         void *r = op1_raster();
         static const int32_t y4[] = { OP1_Q10(13.25), OP1_Q10(42.98), OP1_Q10(18.65), OP1_Q10(37.57) };
