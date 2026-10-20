@@ -1,3 +1,9 @@
+# nvmsocool's custom op-1 engines and effects! 
+
+right now it's just brassophone, more info and plugins to come!
+
+
+original readme:
 # op1r-src
 
 Source code of **op1r**, custom firmware for the Teenage Engineering OP-1 (firmware R246): custom synth engines and
