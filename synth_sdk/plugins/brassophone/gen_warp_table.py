@@ -45,7 +45,7 @@ lines.append("/* s = 0..63 (phase index), t = 0..256 (timbre 0..20 mapped from c
 lines.append("static const int16_t warp_table[64][257] = {")
 
 for s in range(NUM_SAMPLES):
-    ph_f = s / (NUM_SAMPLES - 1)  # 0 to 1
+    ph_f = s / NUM_SAMPLES  # 0 to 1
     lines.append("    {  // s=%d, ph_f=%.4f" % (s, ph_f))
     
     vals = []
