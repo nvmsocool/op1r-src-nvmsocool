@@ -15,8 +15,8 @@ Output: C array of Q15 values in [0, 32767] representing [0, 1].
 import math
 
 NUM_SAMPLES = 64  # 6-bit phase resolution
-MAX_TIMBRE = 20
-NUM_COLUMNS = 256
+MAX_TIMBRE = 30
+NUM_COLUMNS = 64
 
 def warp(ph_f, timbre):
     """Warp normalized phase ph_f in [0,1] toward the center by timbre."""
@@ -41,8 +41,8 @@ def to_q15(v):
 
 lines = []
 lines.append("/* Exponential phase warp table: warp_table[s][t] = Q15 warped phase in [0,1] */")
-lines.append("/* s = 0..63 (phase index), t = 0..256 (timbre 0..20 mapped from column) */")
-lines.append("static const int16_t warp_table[64][257] = {")
+lines.append("/* s = 0..63 (phase index), t = 0..64 (timbre 0..100 mapped from column) */")
+lines.append("static const int16_t warp_table[64][65] = {")
 
 for s in range(NUM_SAMPLES):
     ph_f = s / NUM_SAMPLES  # 0 to 1

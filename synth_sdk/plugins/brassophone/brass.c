@@ -19,7 +19,7 @@
 #define VIBRATO_MIN_INC   0          /*  0   Hz */
 #define VIBRATO_MAX_INC   3116530    /* 32   Hz */
 
-/* Vibrato depth range: white knob maps to 0..~90 cents (peak). */
+/* Vibrato depth range: white knob maps to 0..~90 cents (peak) on a squared curve for more control at the low end. */
 #define VIBRATO_MAX_AMT   (BEND_AMOUNT * 2)
 
 /* Vibrato gate: it fades in only once the stock envelope has reached sustain, i.e. it has stayed within
@@ -74,14 +74,20 @@ static void brass_note_off(void *self)
     ((brass_voice_t *)self)->held = 0;
 }
 
-/* Warped phase (Q15) at oscillator row s (0..63) + fraction frac_q15, in table column col.
+/* Warped phase (Q15) at oscillator row s + row_frac_q15, column col + col_frac_q15, 4-point bilinear interpolation.
  * The row after row 63 is the end of the cycle (32768): the warped phase keeps rising through the last
  * 1/64 of the cycle instead of freezing on row 63 and then jumping back to row 0. */
-static inline int32_t warp_row(int32_t s, int32_t frac_q15, int32_t col)
+static inline int32_t warp_lookup(int32_t s, int32_t row_frac_q15, int32_t col, int32_t col_frac_q15)
 {
-    int32_t a = warp_table[s][col];
-    int32_t b = s < 63 ? warp_table[s + 1][col] : 32768;
-    return a + op1_mul16(b - a, frac_q15);
+    int32_t w00 = warp_table[s][col];
+    int32_t w10 = s < 63 ? warp_table[s + 1][col] : 32768;
+    int32_t w01 = warp_table[s][col + 1];
+    int32_t w11 = s < 63 ? warp_table[s + 1][col + 1] : 32768;
+    /* Interpolate horizontally at top and bottom rows. */
+    int32_t top = w00 + op1_mul16(w01 - w00, col_frac_q15);
+    int32_t bottom = w10 + op1_mul16(w11 - w10, col_frac_q15);
+    /* Interpolate vertically. */
+    return top + op1_mul16(bottom - top, row_frac_q15);
 }
 
 static void brass_render(void *self, int16_t *out, const int16_t *params)
@@ -125,8 +131,9 @@ static void brass_render(void *self, int16_t *out, const int16_t *params)
     int32_t knob_sq = (params[3] * params[3]) >> 15;
     int32_t vibrato_phase_inc = VIBRATO_MIN_INC + (int32_t)(((int64_t)(VIBRATO_MAX_INC - VIBRATO_MIN_INC) * knob_sq) >> 15);
 
-    /* White knob (0..32767) maps to vibrato depth, scaled by the fade-in. */
-    int32_t vibrato_amt_q15 = (params[2] * VIBRATO_MAX_AMT) >> 15;
+    /* White knob (0..32767) maps to vibrato depth, squared: x^2 in Q15 gives fine control at the low end. */
+    int32_t white_sq = (params[2] * params[2]) >> 15;
+    int32_t vibrato_amt_q15 = (white_sq * VIBRATO_MAX_AMT) >> 15;
     vibrato_amt_q15 = op1_mul16(vibrato_amt_q15, v->vibrato_depth);
 
     /* Smooth blue/green tracking of the start position. Rounded up when rising so it reaches the target exactly
@@ -139,15 +146,15 @@ static void brass_render(void *self, int16_t *out, const int16_t *params)
     int32_t width = params[1];
 
     for (int n = 0; n < OP1_BLOCK; n++) {
-        /* Smoothed envelope (Q15, 0..32767). */
+        /* Smoothed envelopes (Q15, 0..32767): raw (pitch bend) and normalised to the note's peak (timbre). */
         env_q += env_step;
         int32_t env_val = env_q >> 7;
 
         /* Interpolation: start (blue, limited by green) + sweep (green) scaled by the envelope. */
         int32_t interp_amount = interp_start + op1_mul16(width, env_val);
         interp_amount = interp_amount > 32767 ? 32767 : (interp_amount < 0 ? 0 : interp_amount);
-        int32_t col_pos = interp_amount * 256;         /* column position, 15 fractional bits */
-        int32_t col = col_pos >> 15;                   /* 0..255 */
+        int32_t col_pos = interp_amount * 64;          /* column position */
+        int32_t col = col_pos >> 15;                   /* 0..63 */
         int32_t col_frac = col_pos & 0x7FFF;
 
         /* Pitch bend: driven by the envelope. */
@@ -166,12 +173,10 @@ static void brass_render(void *self, int16_t *out, const int16_t *params)
         /* Advance oscillator phase. */
         ph += (uint32_t)effective_inc;
 
-        /* Phase warp: bilinear in (oscillator phase, table column). */
+        /* Phase warp: 4-point bilinear in (oscillator phase row, table column). */
         int32_t s = ph >> 26;
-        int32_t frac_q15 = (ph & 0x3FFFFFF) >> 11;
-        int32_t w0 = warp_row(s, frac_q15, col);
-        int32_t w1 = warp_row(s, frac_q15, col + 1);
-        int32_t ph_f_warped = w0 + op1_mul16(w1 - w0, col_frac);
+        int32_t row_frac_q15 = (ph & 0x3FFFFFF) >> 11;
+        int32_t ph_f_warped = warp_lookup(s, row_frac_q15, col, col_frac);
 
         /* Convert warped phase to sine table index. */
         int32_t sine_idx = (ph_f_warped * 8191) >> 15;
