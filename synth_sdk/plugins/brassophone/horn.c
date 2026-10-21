@@ -103,8 +103,8 @@ static void horn_update(void *scr, int dt)
     if (balloon_node) {
         int32_t s = 8192 + ((int32_t)k[2] * 24575 >> 15);  /* Q10: 256..1024 */
         if (k[2] > 0) {
-            vibrato_ph += (uint32_t)k[2] * dt >> 11;
-            int32_t shake = tsin(vibrato_ph) * 102 >> 15;  /* ±102 in Q10 ≈ ±10% */
+            vibrato_ph += (uint32_t)k[3] * dt >> 8;
+            int32_t shake = tsin(vibrato_ph) * 202 >> 15;  /* ±102 in Q10 ≈ ±10% */
             s += shake;
         }
         int32_t m[9];
