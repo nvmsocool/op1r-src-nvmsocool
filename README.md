@@ -1,7 +1,7 @@
 # nvmsocool's custom op-1 engines and effects! 
 
 ## Brassophone
-![supersaw](synth_sdk\display\brassophone_preview.png)
+![brassophone](synth_sdk/display/brassophone_preview.png)
 graphics hand drawn by me, inspired by Dr Seuss
 
 A brass instrument synthesizer based on a great video by Eric Bowman
