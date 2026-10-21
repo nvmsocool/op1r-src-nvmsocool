@@ -1,6 +1,24 @@
 # nvmsocool's custom op-1 engines and effects! 
 
-right now it's just brassophone, more info and plugins to come!
+## Brassophone
+![supersaw](synth_sdk\display\brassophone_preview.png)
+graphics hand drawn by me, inspired by Dr Seuss
+
+A brass instrument synthesizer based on a great video by Eric Bowman
+Brass instruments sweep up in timbre and pitch during their attack, and skilled players add vibrato during the sustain:
+
+| encoder | function |
+|---|---|
+| blue | starting timbre |
+| green | timbre attack sweep width |
+| white | vibrato amplitude |
+| red |vibrato frequency |
+
+**WARNIING**
+To get the sultriest of horns, you should adjust the attack to be a little slower and slap on a fat reverb
+
+
+# ...More engines to come!
 
 
 original readme:
