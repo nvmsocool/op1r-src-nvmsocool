@@ -154,9 +154,11 @@ static void reedy_render(void *self, int16_t *out, const int16_t *params)
         int32_t env_val = env_q >> 7;
 
         /* Noise fade: from 100% at note onset toward green target during attack.
-         * The envelope drives the fade: env_val goes from 0 to peak during attack. */
+         * The envelope drives the fade: env_val goes from 0 to peak during attack.
+         * At env_val=0: noise_level = 32767 (100%).
+         * At env_val=32767: noise_level = noise_target (green knob). */
         int32_t noise_fade = op1_mul16(32767 - noise_target, env_val);
-        noise_level = noise_target + noise_fade;
+        noise_level = 32767 - noise_fade;
         noise_level = noise_level > 32767 ? 32767 : (noise_level < 0 ? 0 : noise_level);
 
         /* Interpolation modulation: sine LFO modulating the interpolation amount. */
