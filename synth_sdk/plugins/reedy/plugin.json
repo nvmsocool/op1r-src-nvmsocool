@@ -1,0 +1,15 @@
+{
+  "name": "reedy",
+  "author": "nvmsocool",
+  "kind": "synth",
+  "symbol": "ENGINE_reedy",
+  "sources": [
+    "reedy.c"
+  ],
+  "defaults": [
+    0,
+    0,
+    0,
+    0
+  ]
+}
