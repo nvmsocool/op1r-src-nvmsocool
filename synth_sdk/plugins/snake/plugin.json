@@ -1,0 +1,19 @@
+{
+  "name": "snake",
+  "author": "nvmsocool",
+  "kind": "fx",
+  "symbol": "FX_snake",
+  "sources": [
+    "snake.c"
+  ],
+  "defaults": [
+    14528,
+    0,
+    0,
+    0
+  ],
+  "screen": {
+    "svg": "snakegame.svg",
+    "symbol": "SCREEN_snake"
+  }
+}

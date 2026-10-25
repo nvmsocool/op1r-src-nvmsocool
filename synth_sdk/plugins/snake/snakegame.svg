@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<svg version="1.1" id="Layer_1" xmlns="http://www.w3.org/2000/svg" x="0px" y="0px"
+	 width="320px" height="160px" viewBox="0 0 320 160">
+<!-- snake: only the wall is static; the snake, the food and the texts are drawn by code.
+     The visible part of the display ends at about y 140, so the wall stops at 137. -->
+<rect fill="none" stroke="#6F7173" stroke-width="1" x="3" y="3" width="314" height="134"/>
+</svg>
