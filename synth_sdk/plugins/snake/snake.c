@@ -3,23 +3,20 @@
  * The screen is the game. The keys steer the snake while the synth plays as usual (the FX does not swallow them):
  * a key you press turns the snake by 90 degrees depending on the key you pressed before it: a higher key turns it
  * clockwise, a lower key counter-clockwise. The same key twice in a row does nothing. There is no cooldown. The first
- * key starts the game, and after a game over a key held for 1.5 s starts a new one (that also empties the loop).
+ * key starts the game, and after a game over a key held for 1.5 s starts a new one.
  *
- * The sound is the score: every food the snake eats puts one random note into a 16-step loop that plays at the OP-1
- * tempo (it starts empty). Each note is a short sine blip of an A minor pentatonic over two octaves; the loop follows
- * the metronome's beat clock, one step per 1/16 note. Eating also plays the new note at once, and the game over plays a
- * low tone. Blue knob = game sound level (the dry synth is untouched).
+ * Sound: the game over plays a low tone. Blue knob = game sound level (the dry synth is untouched).
  *
  * The snake is one line. The food is a 6x6 square. Eating it: the food disappears, the snake grows a little longer,
- * +1 point, the snake gets a little faster, a random note joins the loop, a new food appears somewhere else.
- * Hitting yourself or a wall ends the game: the loop keeps playing, the screen shows the score.
+ * +1 point, the snake gets a little faster, a new food appears somewhere else.
+ * Hitting yourself or a wall ends the game: the screen shows the score.
  *
  * Custom FX (docs/51): the game runs in the screen update (GUI thread, dt in ms) and only while its screen is shown.
  * Keys are observed non-destructively in the KeyHandler queue (s_key_queue, 0x01DD5044, u16 code | pressed << 8):
  * the game never consumes them, so the synth still gets every note. Positions are Q10 pixels of the 320 x 160
  * screen. The snake is a polyline of corner points (axis-aligned segments); the head moves in steps of at most 2 px
- * so nothing is skipped at high speed. The audio side only reads the loop and drives a few sine voices in the FX
- * bus. State is per FX position where it matters (the voices); the game itself is shared by the visible FX page.
+ * so nothing is skipped at high speed. The audio side plays the game-over tone in the FX bus. State is per FX position
+ * where it matters (the tone); the game itself is shared by the visible FX page.
  * Copyright (C) 2026 nick (nvmsocool). GPL-3.0-or-later with the OP-1 firmware permission (see LICENSE and NOTICE). */
 #include "op1_plugin.h"
 #include "seq/seq_text.h"                 /* stroke-font text (as arc / palme / mixtur) */
@@ -44,23 +41,12 @@
 #define STEP_MAX     PX(2)
 #define RESTART_MS   1500                 /* hold a key this long on the end screen */
 
-/* ---- loop constants ---- */
-#define LOOP_STEPS   16                   /* one bar of 1/16 notes */
+/* ---- audio constants ---- */
 #define NPOS         3                    /* synth / drum / master */
 
 enum { S_READY, S_PLAY, S_OVER };
 enum { D_UP, D_LEFT, D_DOWN, D_RIGHT };   /* clockwise is (d + 3) & 3, counter-clockwise (d + 1) & 3 */
 static const int8_t DX[4] = { 0, -1, 0, 1 }, DY[4] = { -1, 0, 1, 0 };
-
-/* the minor pentatonic over two octaves: A3, C4, D4, E4, G4, A4, C5, D5, E5, G5 */
-/* phase increment per sample for the same ten pitches (2^32 = one cycle) */
-static const uint32_t PENT_INC[10] = {
-    21426141u, 25480119u, 28600467u, 32102938u, 38177043u,
-    42852281u, 50960238u, 57200933u, 64205877u, 76354085u
-};
-
-/* the loop: written by the game (GUI), read by the audio render */
-static volatile int8_t loop_note[LOOP_STEPS];      /* 0 = empty, else 1 + index into PENT_SEMI */
 
 /* key codes of the 24 keyboard keys in the KeyHandler queue (seqdev/ms_fw.c kb_keys) */
 static const uint8_t KEY_CODE[24] = {
@@ -71,7 +57,6 @@ static const uint8_t KEY_CODE[24] = {
 typedef struct {
     volatile int state;               /* read by the audio render */
     volatile int init;                /* 0 = the screen must reset the game (audio init asked for it) */
-    volatile uint32_t gen;            /* bumped on every reset: the audio render restarts its loop at step 0 */
     op1_pt   p[MAXV];                 /* p[0] tail end ... p[n-1] head */
     int      n;
     int      dir;
@@ -94,17 +79,8 @@ static volatile uint32_t sn_keys;
 static uint32_t rnd(void) { g.rng ^= g.rng << 13; g.rng ^= g.rng >> 17; g.rng ^= g.rng << 5; return g.rng; }
 static int32_t iabs(int32_t a) { return a < 0 ? -a : a; }
 
-/* ---- note events (game -> audio): 1..10 = pentatonic degree, 0x20 = game over ---- */
-#define EVQ_N 16
-static volatile uint8_t evq[NPOS][EVQ_N];
-static volatile uint8_t evq_w[NPOS], evq_r[NPOS];
-
-static void ev_push(int pos, int ev)
-{
-    pos %= NPOS;
-    uint8_t w = evq_w[pos], n = (uint8_t)((w + 1) % EVQ_N);
-    if (n != evq_r[pos]) { evq[pos][w] = (uint8_t)ev; evq_w[pos] = n; }
-}
+/* game -> audio: a game over happened (the audio render starts the low tone and clears it) */
+static volatile uint8_t over_evt[NPOS];
 
 /* distance (squared, Q6 px) from point (x, y) to the axis-aligned segment a-b, and where on the segment the closest
  * point is (|closest - b|, Q10 px) */
@@ -175,7 +151,6 @@ static void game_reset(void)
     spawn_food();
     g.state = S_READY;
     g.init = 1;
-    g.gen++;
 }
 
 /* drop the tail until the line is as long as wanted */
@@ -205,15 +180,6 @@ static int turn(int d)
     return 1;
 }
 
-/* a random new note in the loop, and the same note at once (the food's reward) */
-static void add_note(int pos)
-{
-    int s = (int)(rnd() % LOOP_STEPS);
-    int d = (int)(rnd() % 10u);
-    loop_note[s] = (int8_t)(1 + d);
-    ev_push(pos, 1 + d);
-}
-
 static void game_step(int dt, int pos)
 {
     int32_t dist = g.speed * dt * 1024 / 1000;           /* Q10 px this frame */
@@ -225,14 +191,13 @@ static void game_step(int dt, int pos)
         trim_tail();
         if (hit_wall() || hit_self()) {                  /* a held key starts the next game */
             g.state = S_OVER; g.have_prev = 0; g.hold_ms = 0; g.hold_armed = 0;
-            ev_push(pos, 0x20);
+            over_evt[pos] = 1;
             return;
         }
         if (food_hit()) {
             g.score++;
             g.len += GROW;
             g.speed += SPEED_UP; if (g.speed > SPEED_MAX) g.speed = SPEED_MAX;
-            add_note(pos);
             spawn_food();
         }
     }
@@ -253,7 +218,7 @@ static void on_key(int key)
         g.prev_key = key; g.have_prev = 1; g.hold_armed = 1;
         return;
     }
-    if (g.state != S_PLAY) {                                 /* first key: start playing with an empty loop */
+    if (g.state != S_PLAY) {                                 /* first key: start playing */
         g.rng ^= g.tick * 2654435761u; if (!g.rng) g.rng = 1;
         g.state = S_PLAY;
         g.prev_key = key; g.have_prev = 1;
@@ -299,102 +264,48 @@ void host_sn_key(int key, int down)
     if (down) { sn_keys |= 1u << key; on_key(key); }
     else      sn_keys &= ~(1u << key);
 }
-void host_sn_keymap(void) { key_map_init(); }
 int  host_sn_state(void) { return g.state; }
 int  host_sn_score(void) { return g.score; }
 int  host_sn_head_x(void) { return g.p[g.n - 1].x; }
 int  host_sn_head_y(void) { return g.p[g.n - 1].y; }
 int  host_sn_len(void) { return g.n; }
-uint32_t host_sn_gen(void) { return g.gen; }
-int  host_sn_hold(void) { return g.hold_ms; }
 void host_sn_place_food(int x, int y) { g.food.x = x; g.food.y = y; }
-int  host_sn_notes(void) { int n = 0; for (int i = 0; i < LOOP_STEPS; i++) if (loop_note[i]) n++; return n; }
-int  host_sn_loop(int i) { return i >= 0 && i < LOOP_STEPS ? loop_note[i] : 0; }
 #endif
 
-/* ---- audio: a few sine voices over the FX bus ---- */
-#define SN_VOICES 6
+/* ---- audio: the game-over tone over the FX bus ---- */
 typedef struct { uint32_t phase, inc; int32_t env, dec; } sn_voice_t;
-typedef struct {
-    sn_voice_t v[SN_VOICES];
-    int32_t step_left;                /* samples to the next 1/16 note */
-    int32_t step;                     /* 0..15 */
-    uint32_t gen;                     /* game generation the loop follows */
-} sn_audio_t;
-static sn_audio_t au[NPOS];
+static sn_voice_t au[NPOS];
 
 static inline int32_t sn_sine(uint32_t ph) { return OP1_SINE_TABLE[((int32_t)ph >> 19) + 4096]; }
 
-static void voice_start(sn_audio_t *a, int32_t inc, int32_t env, int32_t dec)
+static void tone_start(sn_voice_t *v, int32_t inc, int32_t env, int32_t dec)
 {
-    int best = 0;
-    for (int i = 1; i < SN_VOICES; i++) if (a->v[i].env < a->v[best].env) best = i;
-    sn_voice_t *v = &a->v[best];
     v->phase = 0; v->inc = (uint32_t)inc; v->env = env; v->dec = dec < 1 ? 1 : dec;
-}
-
-/* samples per 1/16 note from the OP-1 beat clock (120 BPM when there is no clock yet) */
-static int32_t step_samples(void)
-{
-    op1_beat_t b;
-    op1_beat_clock(&b);
-    int32_t spb = b.len > (256 << 14) ? (b.len >> 14) : 22050;   /* samples per beat */
-    int32_t s = spb >> 2;
-    return s < 256 ? 256 : (s > 44100 ? 44100 : s);
 }
 
 static void audio_render(int pos, int16_t *buf, int32_t gain)
 {
-    sn_audio_t *a = &au[pos];
+    sn_voice_t *v = &au[pos];
 
-    /* one-shot notes from the game (food / game over) */
-    uint8_t r = evq_r[pos];
-    while (r != evq_w[pos]) {
-        int ev = evq[pos][r];
-        r = (uint8_t)((r + 1) % EVQ_N);
-        if (ev >= 1 && ev <= 10) voice_start(a, PENT_INC[ev - 1], 22000, 4);
-        else if (ev == 0x20)    voice_start(a, 10713070, 30000, 2);  /* A2, long low tone */
-    }
-    evq_r[pos] = r;
-
-    /* the loop runs while the game plays or is over; a new game restarts it at step 0 */
-    int st = g.state;
-    if (g.gen != a->gen) { a->gen = g.gen; a->step = 0; a->step_left = 0; }
-    if (st == S_PLAY || st == S_OVER) {
-        int32_t len = step_samples();
-        if (a->step_left <= 0) {
-            int8_t d = loop_note[a->step];
-            int32_t gate = len * 3 / 5;                        /* ~60 % of the step */
-            if (d >= 1 && d <= 10) voice_start(a, PENT_INC[d - 1], 24000, 24000 / gate);
-            a->step = (a->step + 1) & (LOOP_STEPS - 1);
-            a->step_left += len;
-        }
-        a->step_left -= OP1_FX_BLOCK;
-    } else {
-        a->step = 0; a->step_left = 0;
-    }
+    /* the game-over tone: started once, then it decays on its own */
+    if (over_evt[pos]) { over_evt[pos] = 0; tone_start(v, 10713070, 30000, 2); }   /* A2, long low tone */
+    if (v->env <= 0) return;                          /* silent: the synth's audio passes untouched */
 
     for (int n = 0; n < OP1_FX_BLOCK; n++) {
-        int32_t s = 0;
-        for (int i = 0; i < SN_VOICES; i++) {
-            sn_voice_t *v = &a->v[i];
-            if (v->env <= 0) continue;
-            int32_t e = (v->env * gain) >> 15;                  /* fold the level in per voice: no 32-bit overflow */
-            s += (sn_sine(v->phase) * e) >> 15;
-            v->phase += v->inc;
-            v->env -= v->dec;
-        }
+        if (v->env <= 0) break;                       /* the tone has ended */
+        int32_t e = (v->env * gain) >> 15;
+        int32_t s = (sn_sine(v->phase) * e) >> 15;
         if (s) buf[n] = op1_sat16(buf[n] + s);
+        v->phase += v->inc;
+        v->env -= v->dec;
     }
 }
 
 static void snake_init(int pos)
 {
     pos %= NPOS;
-    sn_audio_t *a = &au[pos];
-    for (int i = 0; i < SN_VOICES; i++) a->v[i].env = 0;
-    a->step = 0; a->step_left = 0; a->gen = g.gen;
-    evq_w[pos] = evq_r[pos] = 0;
+    au[pos].env = 0;
+    over_evt[pos] = 0;
     /* the game is reset by the screen thread (the audio thread must not write the game state) */
     g.init = 0;
     g.state = S_READY;
@@ -411,12 +322,6 @@ static void snake_render(int pos, int16_t *buf, const int16_t *p)
 
 const op1_fx_t FX_snake = { snake_init, snake_render,
                             { OP1_PRESS_NONE, OP1_PRESS_NONE, OP1_PRESS_NONE, OP1_PRESS_NONE }, 0 };
-
-#ifdef OP1_HOST
-int host_sn_astep(void) { return au[0].step; }
-int host_sn_aleft(void) { return au[0].step_left; }
-int host_sn_aenv(void) { int e = 0; for (int i = 0; i < SN_VOICES; i++) if (au[0].v[i].env > e) e = au[0].v[i].env; return e; }
-#endif
 
 /* ---- screen ---- */
 static const uint8_t C_SNAKE[4] = { 0x00, 0xED, 0x95, 0xFF }, C_DEAD[4] = { 0x6F, 0x71, 0x73, 0xFF },
@@ -462,7 +367,6 @@ static void sn_screen_update(void *scr, int dt)
             g.hold_ms += dt;
             if (g.hold_ms >= RESTART_MS) {
                 int key = g.prev_key;
-                for (int i = 0; i < LOOP_STEPS; i++) loop_note[i] = 0;
                 game_reset();
                 g.rng ^= g.tick * 2654435761u; if (!g.rng) g.rng = 1;
                 g.state = S_PLAY;
