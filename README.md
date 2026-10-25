@@ -17,8 +17,23 @@ Brass instruments sweep up in timbre and pitch during their attack, and skilled 
 **WARNIING**
 To get the sultriest of horns, you should adjust the attack to be a little slower and slap on a fat reverb
 
+## Snake
+![snake](synth_sdk/display/snake_preview_single.png)
 
-# ...More engines to come!
+A simple large room reverb/delay combo effect. Oh yeah and a game of snake.
+
+Controls:
+
+| control | function |
+|---|---|
+| blue | reverb time |
+| green | reverb mix |
+| white | delay time |
+| red | delay mix |
+| notes | turn the snake |
+
+
+# ...More to come!
 
 
 original readme:
