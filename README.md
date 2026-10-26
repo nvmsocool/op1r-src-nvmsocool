@@ -32,6 +32,26 @@ Controls:
 | red | delay mix |
 | notes | turn the snake |
 
+## Scope-b
+![scope-b](synth_sdk/display/scopeb_preview_single.png)
+
+A pass-through oscilloscope effect.  It watches the signal in the FX slot and draws it on
+its own screen; the audio itself is unchanged.
+
+| encoder | function |
+|---|---|
+| blue | retrig type: `auto`, `asc`, `desc`, `inst` |
+| green | vertical range: 0 .. 48 dB below full scale (display gain) |
+| white | horizontal length: 20 Hz .. 4 kHz (one period of this frequency fills the screen) |
+| red | hold: turn past halfway to freeze the trace, back to run; press the red encoder to toggle the latch |
+
+`auto` triggers on the most recent zero crossing of either slope, `asc` on a rising crossing,
+`desc` on a falling crossing, and `inst` simply shows the latest samples without triggering.
+A small deadband keeps noise around zero from retriggering the trace.  While hold is on (red knob past
+halfway or red encoder latched) the trace and its settings are frozen; release hold to resume.
+
+The screen has a small settings strip at the top, a 4 x 4 grid and the waveform in the main area.
+
 
 # ...More to come!
 

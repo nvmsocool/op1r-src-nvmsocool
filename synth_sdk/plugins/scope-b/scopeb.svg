@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<svg version="1.1" id="Layer_1" xmlns="http://www.w3.org/2000/svg" x="0px" y="0px"
+	 width="320px" height="160px" viewBox="0 0 320 160">
+<!-- scope-b: the frame and the separator under the settings strip are static; the grid and the
+     waveform are drawn by scopeb.c.  The visible part of the display ends at about y 140. -->
+<rect fill="none" stroke="#6F7173" stroke-width="1" x="2" y="2" width="316" height="136"/>
+<line fill="none" stroke="#6F7173" stroke-width="1" stroke-linecap="square" x1="4" y1="18" x2="316" y2="18"/>
+</svg>

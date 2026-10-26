@@ -1,0 +1,19 @@
+{
+  "name": "scope-b",
+  "author": "nvmsocool",
+  "kind": "fx",
+  "symbol": "FX_scope_b",
+  "sources": [
+    "scopeb.c"
+  ],
+  "defaults": [
+    0,
+    8192,
+    14000,
+    0
+  ],
+  "screen": {
+    "svg": "scopeb.svg",
+    "symbol": "SCREEN_scope_b"
+  }
+}
