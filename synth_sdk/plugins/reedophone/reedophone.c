@@ -117,6 +117,32 @@ static inline int32_t clampi(int32_t x, int32_t lo, int32_t hi) { x = x < lo ? l
 #define sat16(x) clampi((x), -32768, 32767)
 /* a (int32) x b (Q15) without 64-bit math */
 static inline int32_t mul32x15(int32_t a, int32_t b) { return (a >> 15) * b + (((a & 0x7fff) * b) >> 15); }
+/* The Blackfin has no divide instruction: a 64-bit `/` is a libgcc call of about a thousand cycles. The setup code
+ * below divides in 32 bits where the operands fit (same truncation) and long-divides the rest with these, bit for
+ * bit the same quotients. */
+/* floor((r 2^32 + lo) / 2^(32 - n) / d) mod 2^32 for r < d: restoring division shifting in the top n bits of lo,
+ * one quotient bit a step (d may use all 32 bits) */
+static uint32_t divlo(uint32_t r, uint32_t lo, int n, uint32_t d)
+{
+    uint32_t q = 0;
+    for (int i = 0; i < n; i++) {
+        uint32_t c = r >> 31;
+        r = (r << 1) | (lo >> 31); lo <<= 1; q <<= 1;
+        if (c || r >= d) { r -= d; q |= 1; }
+    }
+    return q;
+}
+#define shdiv(r, n, d) divlo((r), 0, (n), (d))       /* floor(r 2^n / d) mod 2^32, r < d */
+/* floor((hi 2^32 + lo) / d), the whole 64-bit quotient */
+static uint64_t udiv64(uint32_t hi, uint32_t lo, uint32_t d)
+{
+    return ((uint64_t)(hi / d) << 32) | divlo(hi % d, lo, 32, d);
+}
+/* (a b) >> s for a < 2^32, b < 2^16, s <= 16, when the result fits 32 bits: a split at bit s */
+static inline uint32_t mulsh(uint32_t a, uint32_t b, int s)
+{
+    return (a >> s) * b + (((a & ((1u << s) - 1)) * b) >> s);
+}
 
 /* sqrt(i * 2^24) - 32768 for i = 64..256 (w = v << 2k has its top bit at 30 or 31) */
 static const uint16_t SQT[193] = {
@@ -152,7 +178,7 @@ static const int32_t BLUE_MK[8] = { 147768, 142053, 120827, 81640, 46535, 24492,
 static int32_t blue_mk(int32_t k)
 {
     int i = 0; while (i < 6 && k > BLUE_K[i + 1]) i++;
-    return BLUE_MK[i] + (int32_t)(((int64_t)(BLUE_MK[i + 1] - BLUE_MK[i]) * (k - BLUE_K[i])) / (BLUE_K[i + 1] - BLUE_K[i]));
+    return BLUE_MK[i] + ((BLUE_MK[i + 1] - BLUE_MK[i]) * (k - BLUE_K[i])) / (BLUE_K[i + 1] - BLUE_K[i]);   /* < 2^31 */
 }
 /* sin(2 pi ph / 2^32), Q15, interpolated */
 static int32_t sin_q15(uint32_t ph)
@@ -163,9 +189,10 @@ static int32_t sin_q15(uint32_t ph)
 }
 /* atan(t) for t in Q15 [0, 1] -> radians Q16 */
 static const uint16_t ATT[33] = { 0, 2047, 4091, 6126, 8150, 10158, 12147, 14114, 16055, 17968, 19850, 21699, 23512, 25289, 27028, 28727, 30386, 32003, 33580, 35115, 36608, 38060, 39472, 40842, 42172, 43464, 44716, 45931, 47109, 48251, 49359, 50432, 51472 };
-static int32_t atan_q16(int32_t y, int32_t x)   /* atan2 for x > 0, y >= 0 */
+static int32_t atan_q16(int32_t y, int32_t x)   /* atan2 for 0 < x <= 65535, 0 <= y < 2^15 (setup's re, im) */
 {
-    int inv = y > x; int32_t t = inv ? (int32_t)(((int64_t)x << 15) / y) : (int32_t)(((int64_t)y << 15) / x);
+    int inv = y > x;
+    int32_t t = inv ? (int32_t)(((uint32_t)x << 15) / (uint32_t)y) : (int32_t)(((uint32_t)y << 15) / (uint32_t)x);
     uint32_t i = (uint32_t)t >> 10, f = (uint32_t)t & 1023;
     if (i >= 32) { i = 31; f = 1024; }
     int32_t a = ATT[i] + (int32_t)(((ATT[i + 1] - ATT[i]) * f) >> 10);
@@ -173,74 +200,108 @@ static int32_t atan_q16(int32_t y, int32_t x)   /* atan2 for x > 0, y >= 0 */
 }
 
 /* ---------------------------------------------------------------- per pitch / knob setup (per block, on change) */
+/* setup's values that depend on the pitch alone (p_inc) and on the pitch and the bore knob (b_inc, b_k2), kept with
+ * the inputs they came from: a knob move at a held pitch recomputes only what it reads */
+typedef struct {
+    uint32_t p_inc, P, f0_q8, hinc;
+    int32_t midi_q8, oct_q15, sn, cs, gq15, zeta;
+    uint32_t b_inc; int32_t b_k2;
+    int32_t lpc, tau, gth;
+} rv_pitch_t;
+static rv_pitch_t pc[OP1_VOICES];                /* p_inc 0 never matches (setup clamps inc to >= 400000) */
+/* the 32-bit forms below rely on these */
+typedef char rv_setup_ranges[FCK_Q8 < 32768 && FC_HZ < 16000 && OUT_GAIN <= 8000 && ZSLOPE > -8192 && ZSLOPE < 8192 &&
+                             HUM_DMAX_Q14 < 65536 &&
+                             HUM_JMAX_Q15 < 65536 && FLT_DMAX_Q14 < 65536 && FLT_JMAX_Q15 < 65536 &&
+                             NOISE_Q15 < 65536 && LOSS_Q15 < 32768 && LOSS_K_Q12 < 1024 ? 1 : -1];
+
 #define L2_A4 1661526                            /* log2(2^32 * 440 / 44100) * 65536 */
 static void setup(rv_voice_t *v, rv_state_t *s, uint32_t inc, const int16_t *k)
 {
+    rv_pitch_t *c0 = &pc[s - st];
     if (inc < 400000u) inc = 400000u;            /* ~4 Hz: keeps every delay inside its line */
-    int32_t l2 = log2_q16(inc);
-    int32_t midi_q8 = (69 << 8) + (int32_t)(((int64_t)(l2 - L2_A4) * 12) >> 8);
-    int32_t oct_q15 = (int32_t)(((int64_t)(midi_q8 - (70 << 8)) * 32768) / (12 << 8));
-    /* period in Q16 samples, f0 in Hz Q8 */
-    uint32_t P = (uint32_t)((((uint64_t)1) << 48) / inc);
-    uint32_t f0_q8 = (uint32_t)(((uint64_t)inc * 44100u) >> 24);
-    /* end low-pass: cutoff = max(FC, FCK f0) x bore knob (2^-1 .. 2^1) */
-    uint32_t fc_q8 = (uint32_t)FC_HZ << 8, fl = (uint32_t)(((uint64_t)f0_q8 * FCK_Q8) >> 8);
-    if (fl > fc_q8) fc_q8 = fl;
-    fc_q8 = (uint32_t)(((uint64_t)fc_q8 * exp2_q15(((int32_t)k[2] - 16384) * 4)) >> 15);
-    if (fc_q8 > (16000u << 8)) fc_q8 = 16000u << 8;
-    /* a = exp(-2 pi fc / SR) = 2^(-2 pi fc / SR * log2 e) */
-    int32_t xw = (int32_t)(((uint64_t)fc_q8 * 3449u) >> 16);          /* Q16: fc 2 pi log2(e) / 44100; 2^8 x 0.0526 */
-    int32_t a = (int32_t)exp2_q15(-xw);                                 /* Q15 */
-    s->lpc = 32768 - a; if (s->lpc > 32767) s->lpc = 32767;
-    /* LP response at f0: H = (1-a) / (1 - a e^-jw) */
-    int32_t sn = sin_q15(inc), cs = sin_q15(inc + 0x40000000u);
-    int32_t re = 32768 - ((a * cs) >> 15), im = (a * sn) >> 15;        /* re > 0 */
-    if (im < 0) im = 0;
-    int32_t th = atan_q16(im, re);                                      /* phase lag, rad Q16 */
-    /* tau = th / w0 = th / (2 pi) * P  (Q16 samples) */
-    uint32_t tau = (uint32_t)(((uint64_t)th * 10430u >> 16) * (uint64_t)P >> 16);   /* 65536 / 2pi = 10430.4 */
-    uint32_t den = (uint32_t)(((int64_t)re * re + (int64_t)im * im) >> 15);          /* |1 - a e^-jw|^2, Q15 */
-    /* |H| = (1-a) / sqrt(den), Q15 (isqrt of Q30) */
-    int32_t mag = (int32_t)isqrt_fast((uint32_t)((((uint64_t)(32768 - a) * (32768 - a)) << 15) / (den ? den : 1)) | 4);
-    if (mag > 32767) mag = 32767;
-    /* loss g = 1 - LOSS (f0 / 261.6)^k */
-    int32_t pw = (int32_t)exp2_q15((int32_t)(((int64_t)(midi_q8 - (60 << 8)) * LOSS_K_Q12 / 12) >> 4));   /* Q15 */
-    s->gq15 = 32768 - (int32_t)(((int64_t)LOSS_Q15 * pw) >> 15);
-    if (s->gq15 > 32767) s->gq15 = 32767;
-    if (s->gq15 < 16384) s->gq15 = 16384;
-    int32_t R = (int32_t)(((int64_t)s->gq15 * mag) >> 15);              /* |reflection| at f0, Q15 */
-    if (R > 32700) R = 32700;
-    /* embouchure */
-    int32_t z = ZETA_Q15 + (int32_t)(((int64_t)ZSLOPE * oct_q15) >> 15);
-    s->zeta = clampi(z, 600, 32767);
-    /* threshold: (3g - 1) / (2 sqrt g) = c = (1 - R) / (zeta (1 + R));  sqrt g = (c + sqrt(c^2 + 3)) / 3 */
-    int32_t c = (int32_t)(((int64_t)(32768 - R) << 27) / ((int64_t)s->zeta * (32768 + R)));     /* Q12 */
-    if (c > 32767) c = 32767;
-    int32_t sq = (c + (int32_t)isqrt_fast((uint32_t)(c * c) + (3u << 24) + 4)) / 3;               /* Q12 */
-    s->gth = (sq * sq) >> 11;                                                                   /* Q13 */
-    s->P = P; s->tau = (int32_t)tau; s->midi_q8 = midi_q8; s->corr = 0x40000000;   /* forces set_delays */
+    if (c0->p_inc != inc) {                      /* the pitch alone */
+        int32_t l2 = log2_q16(inc);
+        int32_t midi_q8 = (69 << 8) + (((l2 - L2_A4) * 12) >> 8);                 /* |l2 - L2_A4| < 2^21 */
+        c0->midi_q8 = midi_q8;
+        c0->oct_q15 = ((midi_q8 - (70 << 8)) * 32768) / (12 << 8);                 /* |midi_q8 - 70 << 8| < 2^15 */
+        /* period in Q16 samples, f0 in Hz Q8 */
+        c0->P = shdiv(1, 48, inc);                                                 /* 2^48 / inc */
+        c0->f0_q8 = ((inc >> 16) * 44100u + (((inc & 0xffff) * 44100u) >> 16)) >> 8;   /* inc 44100 >> 24 */
+        c0->sn = sin_q15(inc); c0->cs = sin_q15(inc + 0x40000000u);
+        /* loss g = 1 - LOSS (f0 / 261.6)^k */
+        int32_t pw = (int32_t)exp2_q15((((midi_q8 - (60 << 8)) * LOSS_K_Q12) / 12) >> 4);   /* Q15 */
+        int32_t g = 32768 - (int32_t)(((uint32_t)LOSS_Q15 * (uint32_t)pw) >> 15);
+        if (g > 32767) g = 32767;
+        if (g < 16384) g = 16384;
+        c0->gq15 = g;
+        /* embouchure */
+        c0->zeta = clampi(ZETA_Q15 + ((ZSLOPE * c0->oct_q15) >> 15), 600, 32767);
+        uint32_t h = (inc >> 16) * 46341u + (((inc & 0xffff) * 46341u) >> 16);   /* a tritone below: inc 46341 >> 16 */
+        while (h > 16556555u) h >>= 1;                                             /* fold into 85 .. 170 Hz */
+        while (h < 8278277u) h <<= 1;
+        c0->hinc = h;
+        c0->p_inc = inc; c0->b_inc = 0;
+    }
+    if (c0->b_inc != inc || c0->b_k2 != k[2]) {  /* the pitch and the bore knob */
+        /* end low-pass: cutoff = max(FC, FCK f0) x bore knob (2^-1 .. 2^1) */
+        uint32_t fc_q8 = (uint32_t)FC_HZ << 8, fl = mulsh(c0->f0_q8, FCK_Q8, 8);
+        if (fl > fc_q8) fc_q8 = fl;
+        fc_q8 = mulsh(fc_q8, exp2_q15(((int32_t)k[2] - 16384) * 4), 15);            /* exp2 <= 65534 */
+        if (fc_q8 > (16000u << 8)) fc_q8 = 16000u << 8;
+        /* a = exp(-2 pi fc / SR) = 2^(-2 pi fc / SR * log2 e) */
+        int32_t xw = (int32_t)mulsh(fc_q8, 3449u, 16);                               /* Q16: fc 2 pi log2(e) / 44100 */
+        int32_t a = (int32_t)exp2_q15(-xw);                                          /* Q15 */
+        int32_t lpc = 32768 - a; if (lpc > 32767) lpc = 32767;
+        c0->lpc = lpc;
+        /* LP response at f0: H = (1-a) / (1 - a e^-jw) */
+        int32_t re = 32768 - ((a * c0->cs) >> 15), im = (a * c0->sn) >> 15;        /* re > 0 */
+        if (im < 0) im = 0;
+        int32_t th = atan_q16(im, re);                                               /* phase lag, rad Q16 */
+        /* tau = th / w0 = th / (2 pi) * P  (Q16 samples) */
+        uint32_t t1 = ((uint32_t)th * 10430u) >> 16, P = c0->P;                     /* 65536 / 2pi = 10430.4; th <= 102944 */
+        c0->tau = (int32_t)(t1 * (P >> 16) + ((t1 * (P & 0xffff)) >> 16));         /* t1 P >> 16 */
+        /* |1 - a e^-jw|^2, Q15 (re <= 65535) */
+        uint32_t A = (uint32_t)re * (uint32_t)re, B = (uint32_t)im * (uint32_t)im;
+        uint32_t den = (A >> 15) + (B >> 15) + (((A & 0x7fff) + (B & 0x7fff)) >> 15);
+        if (!den) den = 1;
+        /* |H| = (1-a) / sqrt(den), Q15 (isqrt of Q30): (1 - a)^2 << 15 / den */
+        uint32_t na = (uint32_t)(32768 - a), sq2 = na * na;
+        uint32_t q = ((sq2 / den) << 15) | shdiv(sq2 % den, 15, den);
+        int32_t mag = (int32_t)isqrt_fast(q | 4);
+        if (mag > 32767) mag = 32767;
+        int32_t R = (c0->gq15 * mag) >> 15;                                          /* |reflection| at f0, Q15 */
+        if (R > 32700) R = 32700;
+        /* threshold: (3g - 1) / (2 sqrt g) = c = (1 - R) / (zeta (1 + R));  sqrt g = (c + sqrt(c^2 + 3)) / 3 */
+        int32_t c = (int32_t)shdiv((uint32_t)(32768 - R), 27, (uint32_t)(c0->zeta * (32768 + R)));   /* Q12, < 2^31 */
+        if (c > 32767) c = 32767;
+        int32_t sq = (c + (int32_t)isqrt_fast((uint32_t)(c * c) + (3u << 24) + 4)) / 3;               /* Q12 */
+        c0->gth = (sq * sq) >> 11;                                                                   /* Q13 */
+        c0->b_inc = inc; c0->b_k2 = k[2];
+    }
+    s->lpc = c0->lpc; s->gq15 = c0->gq15; s->zeta = c0->zeta; s->gth = c0->gth;
+    s->P = c0->P; s->tau = c0->tau; s->midi_q8 = c0->midi_q8; s->corr = 0x40000000;   /* forces set_delays */
     /* knobs */
-    s->dyn_scale = (int32_t)(((int64_t)k[0] << 15) / 26214);
-    s->noise = (int32_t)(((int64_t)NOISE_Q15 * k[3]) >> 13);
+    s->dyn_scale = ((int32_t)k[0] * 32768) / 26214;
+    s->noise = (NOISE_Q15 * (int32_t)k[3]) >> 13;
     {   /* growl knob: a = distance from the centre (Q15) */
         int32_t ah = k[1] < 16384 ? (16384 - (int32_t)k[1]) * 2 : 0, af = k[1] > 16384 ? ((int32_t)k[1] - 16384) * 2 : 0;
         ah = (ah * ah) >> 15; af = (af * af) >> 15;      /* squared: more of the knob for the subtle, realistic range */
         int32_t sq = (int32_t)isqrt_fast(((uint32_t)ah << 15) | 4);                       /* sqrt(ah), Q15 */
         int32_t a3 = (((ah * ah) >> 15) * ah) >> 15, f3 = (((af * af) >> 15) * af) >> 15;
-        s->hum_d = (int32_t)((((int64_t)ah * sq) >> 15) * HUM_DMAX_Q14 >> 15);            /* depth ~ a^1.5 */
+        s->hum_d = (((ah * sq) >> 15) * HUM_DMAX_Q14) >> 15;                              /* depth ~ a^1.5 */
         s->hjit = ah ? 164 + ((HUM_JMAX_Q15 * a3) >> 15) : 0;                              /* 0.5 % .. */
         s->flt_d = (af * FLT_DMAX_Q14) >> 15;
         s->fjit = af ? 983 + ((FLT_JMAX_Q15 * f3) >> 15) : 0;                              /* 3 % .. */
-        s->finc = 2142397u + (uint32_t)((973910 * (int64_t)af) >> 15);                    /* 22 .. 32 Hz */
+        s->finc = 2142397u + (uint32_t)af * 29u + (((uint32_t)af * 23638u) >> 15);       /* + 973910 af >> 15: 22 .. 32 Hz */
         /* level make-up: the chaos is quieter (measured: -10.6 dB at full hum ~ a^3, -3.4 dB at full flutter ~ a^1.5) */
         int32_t fs = (int32_t)isqrt_fast(((uint32_t)af << 15) | 4);
-        int32_t mk = (int32_t)(((int64_t)a3 * 115400 + (int64_t)((af * (int64_t)fs) >> 15) * 37000) >> 15);   /* octaves Q16 */
+        int32_t b = (af * fs) >> 15;
+        int32_t mk = 3 * a3 + b + ((17096 * a3 + 4232 * b) >> 15);                       /* (a3 115400 + b 37000) >> 15, octaves Q16 */
         mk += blue_mk(k[0]);                                                               /* + the breath knob's */
-        s->outg = (int32_t)(((int64_t)OUT_GAIN * exp2_q15(mk)) >> 15); if (s->outg > 32767) s->outg = 32767;
-        uint32_t h = (uint32_t)(((uint64_t)inc * 46341u) >> 16);                           /* a tritone below */
-        while (h > 16556555u) h >>= 1;                                                     /* fold into 85 .. 170 Hz */
-        while (h < 8278277u) h <<= 1;
-        s->hinc = h;
+        uint32_t og = ((uint32_t)OUT_GAIN * exp2_q15(mk)) >> 15;                           /* exp2 < 2^20 here */
+        s->outg = og > 32767 ? 32767 : (int32_t)og;
+        s->hinc = c0->hinc;
     }
     v->inc = inc; for (int i = 0; i < 4; i++) v->kn[i] = k[i];
 }
@@ -250,7 +311,7 @@ static void set_delays(rv_state_t *s, int32_t corr)
 {
     s->corr = corr;
     /* loop length (Q16): round trip = P/2, minus the low-pass phase delay */
-    uint32_t P = (uint32_t)(((uint64_t)s->P * exp2_q15((corr * 3495) >> 10)) >> 15);   /* x 2^(cents / 1200): Q16 = corr * 3.413 */
+    uint32_t P = mulsh(s->P, exp2_q15((corr * 3495) >> 10), 15);        /* x 2^(cents / 1200): Q16 = corr * 3.413 */
     int32_t rt = (int32_t)((P >> 1) - (uint32_t)s->tau);
     if (rt < (6 << 16)) rt = 6 << 16;
     s->rt = rt;
@@ -261,13 +322,14 @@ static void set_delays(rv_state_t *s, int32_t corr)
     if (s->lbf_i < 1) { s->lbf_i = 1; frac = 0; }
     if (s->lbf_i > LN - 4) s->lbf_i = LN - 4;
     s->age[0] = (s->lbf_i << 16) + frac - 65536; s->age[1] = s->lbb << 16;
-    /* 4-point Lagrange around lbf_i (taps at delay i-1, i, i+1, i+2), f in Q15 */
+    /* 4-point Lagrange around lbf_i (taps at delay i-1, i, i+1, i+2), f in Q15. Every product fits 32 bits
+     * (f < 2^15); the one that reaches 2^31 is unsigned. */
     int32_t f = frac >> 1, fm1 = f - 32768, fm2 = f - 65536, fp1 = f + 32768;
-    int32_t t01 = (int32_t)(((int64_t)f * fm1) >> 15);                  /* f (f-1) */
-    s->lc[0] = (int32_t)(-(((int64_t)t01 * fm2) >> 15) / 6) >> 1;
-    s->lc[1] = (int32_t)((((int64_t)fp1 * fm1 >> 15) * fm2) >> 15) / 2 >> 1;
-    s->lc[2] = (int32_t)(-((((int64_t)fp1 * f >> 15) * fm2) >> 15) / 2) >> 1;
-    s->lc[3] = (int32_t)((((int64_t)fp1 * t01) >> 15) / 6) >> 1;
+    int32_t t01 = (f * fm1) >> 15;                                       /* f (f-1) */
+    s->lc[0] = (-((t01 * fm2) >> 15) / 6) >> 1;
+    s->lc[1] = (int32_t)(((uint32_t)(-((fp1 * fm1) >> 15)) * (uint32_t)(-fm2)) >> 15) / 2 >> 1;
+    s->lc[2] = (-(((fp1 * f >> 15) * fm2) >> 15) / 2) >> 1;
+    s->lc[3] = (((fp1 * t01) >> 15) / 6) >> 1;
 }
 
 /* A slur (legato note change) with the air column sounding: the wave in each line is time-scaled so that the
@@ -291,24 +353,36 @@ static void warp(rv_state_t *s, const int32_t *a0)
     for (int c = 0; c < 2; c++) {
         int32_t a1 = s->age[c];
         if (a1 < 65536 || a0[c] < 65536 || a1 == a0[c]) continue;                /* a read on the newest samples */
-        uint32_t r = (uint32_t)(((uint64_t)(uint32_t)a0[c] << 16) / (uint32_t)a1);   /* old / new, Q16 */
+        const uint32_t ua0 = (uint32_t)a0[c], ua1 = (uint32_t)a1;
+        uint32_t r = (uint32_t)udiv64(ua0 >> 16, ua0 << 16, ua1);                /* old / new, Q16 (< 2^26) */
         if (r > (16u << 16)) r = 16u << 16;
         int32_t amax = (a1 >> 16) + 3;
         if (r < 65536 || r > (8u << 16)) {
             /* in place: stretching reads younger ages than the one written, so go down; shrinking older: up */
-            int up = r > 65536, a = up ? 0 : amax, da = up ? 1 : -1;
-            for (int n = 0; n <= amax; n++, a += da) warp_set(s, c, w, a, (uint32_t)a * r);
+            if (r > 65536) { uint32_t src = 0; for (int a = 0; a <= amax; a++, src += r) warp_set(s, c, w, a, src); }
+            else { uint32_t src = (uint32_t)amax * r; for (int a = amax; a >= 0; a--, src -= r) warp_set(s, c, w, a, src); }
             continue;
         }
         int32_t K = (int32_t)((r - 65536) * 8 / 7), rate = 65536 + K;           /* Q16 */
-        int32_t b = (a1 >> 2) * 3, ab = (b >> 16) + 1, e = (ab << 16) - b;       /* first age past b, its distance */
-        int64_t T = (int64_t)K * (int32_t)((((uint64_t)(uint32_t)e * (uint32_t)e) << 1) / (uint32_t)a1);  /* Q32 */
-        int64_t D = (((int64_t)K * (2 * e + 65536)) << 17) / a1;                 /* T(a + 1) - T(a), Q32 */
-        int64_t DD = ((int64_t)K << 34) / a1;                                    /* its step, Q32 */
-        for (int a = 0; a <= amax; a++) {                                        /* reads ages >= a: up */
-            int32_t src = a * rate;
-            if (a >= ab) { src -= (int32_t)(T >> 16); T += D; D += DD; }
-            warp_set(s, c, w, a, (uint32_t)src);
+        int32_t b = (a1 >> 2) * 3, ab = (b >> 16) + 1, e = (ab << 16) - b;       /* first age past b, its distance (0 < e <= 65536) */
+        /* T = K (2 e^2 / a1), D = T(a + 1) - T(a) = (K (2e + 65536) << 17) / a1, DD = its step (K << 34) / a1, Q32.
+         * The 64-bit numerators long-divided (all >= 0: K >= 0). */
+        uint32_t ee = (uint32_t)e * (uint32_t)e;                                 /* wraps to 0 at e = 65536 */
+        uint32_t nh = e == 65536 ? 2u : ee >> 31, nl = ee << 1;                  /* 2 e^2 = nh 2^32 + nl */
+        int64_t T = (int64_t)K * (int32_t)udiv64(nh, nl, ua1);
+        uint64_t n = (uint64_t)(uint32_t)K * (uint32_t)(2 * e + 65536);           /* < 2^37 */
+        int64_t D = (int64_t)udiv64((uint32_t)(n >> 15), (uint32_t)n << 17, ua1);
+        int64_t DD = (int64_t)udiv64((uint32_t)K << 2, 0, ua1);
+        /* T, D, DD summed as their high part >> 16 (mod 2^32, as the int32 cast of T >> 16) and low 16 bits */
+        uint32_t Th = (uint32_t)(T >> 16), Tl = (uint32_t)T & 0xffff, Dh = (uint32_t)(D >> 16), Dl = (uint32_t)D & 0xffff;
+        const uint32_t DDh = (uint32_t)(DD >> 16), DDl = (uint32_t)DD & 0xffff;
+        uint32_t src = 0;                                                        /* a rate */
+        int a = 0;
+        for (; a <= amax && a < ab; a++, src += (uint32_t)rate) warp_set(s, c, w, a, src);   /* reads ages >= a: up */
+        for (; a <= amax; a++, src += (uint32_t)rate) {
+            warp_set(s, c, w, a, src - Th);
+            Tl += Dl; Th += Dh + (Tl >> 16); Tl &= 0xffff;
+            Dl += DDl; Dh += DDh + (Dl >> 16); Dl &= 0xffff;
         }
     }
 }
@@ -531,7 +605,7 @@ static void rv_render(void *self, int16_t *out, const int16_t *k)
 
     /* dynamics: the stock envelope (velocity included, ~half scale at its peak) read doubled, x breath knob */
     int32_t env = OP1_VOICE_ENV[OP1_BLOCK - 1] * 2; if (env > 32767) env = 32767;
-    rv_scr_att[vi] = (int16_t)clampi((int32_t)(((int64_t)env << 15) / op1_voice_vel_gain(self)), 0, 32767);
+    rv_scr_att[vi] = (int16_t)clampi((env * 32768) / op1_voice_vel_gain(self), 0, 32767);   /* |env| <= 2^16 */
     int32_t dyn = (int32_t)(((int64_t)env * s->dyn_scale) >> 15); if (dyn > 40959) dyn = 40959;   /* <= 1.25 */
     if (v->fresh) {                               /* a tongued start: the same hold for every note */
         v->fresh = 0;
@@ -552,7 +626,7 @@ static void rv_render(void *self, int16_t *out, const int16_t *k)
     int32_t tgt = s->gth + D_P_Q13 + (((D_F_Q13 - D_P_Q13) * dp) >> 14);
     if (!v->gate) {                               /* release: the player stops blowing as the envelope falls */
         if (!v->rel_init) { v->rel_e = env > 64 ? env : 64; v->rel_init = 1; }
-        int32_t r = (int32_t)(((int64_t)env << 15) / v->rel_e); if (r > 32768) r = 32768;
+        int32_t r = (env * 32768) / v->rel_e; if (r > 32768) r = 32768;
         tgt = (tgt * r) >> 15;
     }
     /* tongued start: while the tongue holds the reed, the pressure stays below the reed's closing point (above it
@@ -567,7 +641,7 @@ static void rv_render(void *self, int16_t *out, const int16_t *k)
      * stages in the release; stepped per block, ramped per sample (Q29, coefs Q30) */
     int32_t tgt16 = tgt << 16, a1 = v->gate ? 0 : REL_B30, a2 = v->gate ? ATT2_B30 : REL_B30;
     int32_t g1n = a2 ? tgt16 + (int32_t)(((int64_t)(s->g1 - tgt16) * a2) >> 30) : tgt16;
-    int32_t gamn = g1n + (int32_t)(((int64_t)(s->gam - g1n) * a1) >> 30);
+    int32_t gamn = a1 ? g1n + (int32_t)(((int64_t)(s->gam - g1n) * a1) >> 30) : g1n;   /* a1 0 while held */
     int32_t gstep = (gamn - s->gam) >> 7;
     s->g1 = g1n;
 
