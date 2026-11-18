@@ -97,7 +97,7 @@ static void rd_note_off(void *self)
     v->rel = 0;
 }
 
-static void rd_render(void *self, int16_t *out, const int16_t *params)
+static __attribute__((unused)) void rd_render(void *self, int16_t *out, const int16_t *params)
 {
     reedie_voice_t *v = (reedie_voice_t *)self;
     int32_t vi = op1_voice_index(self);
@@ -303,7 +303,14 @@ static void rd_render(void *self, int16_t *out, const int16_t *params)
     v->rng = rng;
 }
 
+#ifdef RD_REFERENCE
+#define RD_RENDER rd_render            /* the original above, the reference of harness/reedie_fast_test.c */
+#else
+#include "rd_fast.h"                   /* rd_render_fast: the same samples without libgcc divides, a leaner loop */
+#define RD_RENDER rd_render_fast
+#endif
+
 const op1_engine_t ENGINE_reedie = {
-    rd_note_on, rd_render, rd_note_off,
+    rd_note_on, RD_RENDER, rd_note_off,
     { OP1_PRESS_NONE, OP1_PRESS_NONE, OP1_PRESS_NONE, OP1_PRESS_NONE }
 };

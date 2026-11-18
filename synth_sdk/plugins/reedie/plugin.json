@@ -4,7 +4,8 @@
   "kind": "synth",
   "symbol": "ENGINE_reedie",
   "sources": [
-    "reedie.c"
+    "reedie.c",
+    "rd_asm.S"
   ],
   "defaults": [
     6553,
